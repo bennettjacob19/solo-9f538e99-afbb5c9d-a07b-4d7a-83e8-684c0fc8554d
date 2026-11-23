@@ -171,3 +171,214 @@ def test_admin_endpoints(client):
     assert client.get(f"/regions/{rid}").json()["status"] == "spare"
     assert client.post("/admin/reset-all").status_code == 204
     assert client.get("/groups/0/blocks/0").status_code == 404
+
+
+# ---------------------------------------------------------------- 版本与丢弃
+def test_read_response_carries_monotonic_version(client):
+    r1 = client.put("/groups/0/blocks/0", json=payload("a"))
+    r2 = client.put("/groups/0/blocks/0", json=payload("a"))  # 正文相同
+    r3 = client.put("/groups/0/blocks/1", json=payload("b"))
+    assert [r.json()["version"] for r in (r1, r2, r3)] == [1, 2, 3]
+    body = client.get("/groups/0/blocks/0").json()
+    assert body["version"] == 2
+    # 物理区槽位记录也带版本
+    rid = [r for r in client.get("/regions").json() if r["group_id"] == 0][0][
+        "region_id"
+    ]
+    versions = [s["version"] for s in client.get(f"/regions/{rid}").json()["records"]]
+    assert versions == [1, 2, 3]
+
+
+def test_discard_batch_happy_path_and_404_after_restart(tmp_path, monkeypatch):
+    db = tmp_path / "disc.db"
+    monkeypatch.setenv("DB_PATH", str(db))
+    monkeypatch.setenv("SLOTS_PER_REGION", "3")
+    monkeypatch.setenv("BLOCK_SIZE", "8")
+    monkeypatch.setenv("MIGRATION_STEP_DELAY", "0")
+    import app.main as main_mod
+
+    with TestClient(main_mod.create_app()) as c1:
+        client_put = c1.put("/groups/0/blocks/0", json=payload("a"))
+        c1.put("/groups/0/blocks/1", json=payload("b"))
+        v0 = c1.get("/groups/0/blocks/0").json()["version"]
+        v1 = c1.get("/groups/0/blocks/1").json()["version"]
+        r = c1.post(
+            "/groups/0/discards",
+            json={"blocks": [{"block_id": 0, "version": v0},
+                             {"block_id": 1, "version": v1}]},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "discarded"
+        assert c1.get("/groups/0/blocks/0").status_code == 404
+        assert c1.get("/groups/0/blocks/1").status_code == 404
+        # 丢弃不占槽、也不释放槽
+        rid = [x for x in c1.get("/regions").json() if x["group_id"] == 0][0]
+        assert rid["used_slots"] == 2 and rid["valid_blocks"] == 0
+
+    # 重启续跑后照样 404，直到新写入
+    with TestClient(main_mod.create_app()) as c2:
+        assert c2.get("/groups/0/blocks/0").status_code == 404
+        r = c2.put("/groups/0/blocks/0", json=payload("c"))
+        assert r.status_code == 200
+        assert c2.get("/groups/0/blocks/0").json()["data_ascii"] == "c" * 8
+
+
+def test_discard_batch_409_leaves_all_blocks_untouched(client):
+    client.put("/groups/0/blocks/0", json=payload("a"))
+    client.put("/groups/0/blocks/1", json=payload("b"))
+    v0 = client.get("/groups/0/blocks/0").json()["version"]
+    v1 = client.get("/groups/0/blocks/1").json()["version"]
+
+    # 块缺失
+    r = client.post(
+        "/groups/0/discards",
+        json={"blocks": [{"block_id": 0, "version": v0},
+                         {"block_id": 2, "version": 1}]},
+    )
+    assert r.status_code == 409
+    # 版本不符
+    r = client.post(
+        "/groups/0/discards",
+        json={"blocks": [{"block_id": 0, "version": v0},
+                         {"block_id": 1, "version": v1 + 1}]},
+    )
+    assert r.status_code == 409
+    # 整批失败：两块都仍可读，版本原样
+    assert client.get("/groups/0/blocks/0").json()["version"] == v0
+    assert client.get("/groups/0/blocks/1").json()["version"] == v1
+
+    # 正确版本整批成功
+    r = client.post(
+        "/groups/0/discards",
+        json={"blocks": [{"block_id": 0, "version": v0},
+                         {"block_id": 1, "version": v1}]},
+    )
+    assert r.status_code == 200
+    assert client.get("/groups/0/blocks/0").status_code == 404
+
+
+def test_discard_request_validation(client):
+    client.put("/groups/0/blocks/0", json=payload("a"))
+    v0 = client.get("/groups/0/blocks/0").json()["version"]
+    # 空清单
+    assert client.post("/groups/0/discards", json={"blocks": []}).status_code == 422
+    # 块号重复
+    r = client.post(
+        "/groups/0/discards",
+        json={"blocks": [{"block_id": 0, "version": v0},
+                         {"block_id": 0, "version": v0}]},
+    )
+    assert r.status_code == 400
+    # 组号 / 块号越界
+    assert client.post(
+        "/groups/9/discards", json={"blocks": [{"block_id": 0, "version": 1}]}
+    ).status_code == 422
+    assert client.post(
+        "/groups/0/discards", json={"blocks": [{"block_id": 99, "version": 1}]}
+    ).status_code == 422
+
+
+def test_pending_overwrite_rejects_discard_with_409(client):
+    for b in range(3):
+        client.put(f"/groups/0/blocks/{b}", json=payload("a"))
+    store = client.app.state.store
+    # 确定性构造窗口：覆盖已登记（start_migration）但首步尚未落盘
+    store.start_migration(0, 0, b"z" * 8)
+    assert client.get("/migrations").json()["pending_applied"] is False
+
+    v1 = client.get("/groups/0/blocks/1").json()["version"]
+    r = client.post(
+        "/groups/0/discards",
+        json={"blocks": [{"block_id": 1, "version": v1}]},
+    )
+    assert r.status_code == 409
+    # 整批未生效：块 1 仍可读
+    assert client.get("/groups/0/blocks/1").status_code == 200
+
+    # 首步落盘后覆盖生效，续跑完成搬迁，再丢弃即可成功
+    store.migration_step()
+    while store.get_migration() is not None:
+        store.migration_step()
+    v1 = client.get("/groups/0/blocks/1").json()["version"]
+    r = client.post(
+        "/groups/0/discards",
+        json={"blocks": [{"block_id": 1, "version": v1}]},
+    )
+    assert r.status_code == 200
+    assert client.get("/groups/0/blocks/1").status_code == 404
+
+
+def test_migrated_write_field_survives_inter_step_discard(client, monkeypatch):
+    """触发搬迁的覆盖生效后，即使回包前被丢弃，write 字段仍给落盘结果。"""
+    monkeypatch.setenv("MIGRATION_STEP_DELAY", "0.15")
+    import app.main as main_mod
+
+    with TestClient(main_mod.create_app()) as slow:
+        for b in range(3):
+            slow.put(f"/groups/0/blocks/{b}", json=payload("a"))
+        import threading
+        import time
+
+        resp = {}
+
+        def do_write():
+            resp["r"] = slow.put("/groups/0/blocks/0", json=payload("z"))
+
+        t = threading.Thread(target=do_write)
+        t.start()
+        for _ in range(50):
+            m = slow.get("/migrations").json()
+            if m.get("in_progress") and m.get("pending_applied"):
+                break
+            time.sleep(0.02)
+        # 首步已落盘：用新版本在步间丢弃块 0
+        v0 = slow.get("/groups/0/blocks/0").json()["version"]
+        dr = slow.post(
+            "/groups/0/discards",
+            json={"blocks": [{"block_id": 0, "version": v0}]},
+        )
+        assert dr.status_code == 200
+        t.join()
+
+        r = resp["r"]
+        assert r.status_code == 200
+        assert r.json()["status"] == "migrated"
+        # write 字段仍是那次写入的真实落盘结果
+        write = r.json()["write"]
+        assert write["version"] == v0
+        assert write["data_ascii"] == "z" * 8
+        # 但原读口已按丢弃语义返回 404
+        assert slow.get("/groups/0/blocks/0").status_code == 404
+
+
+def test_discard_during_migration_skips_block_in_new_region(client, monkeypatch):
+    monkeypatch.setenv("MIGRATION_STEP_DELAY", "0.15")
+    import app.main as main_mod
+
+    with TestClient(main_mod.create_app()) as slow:
+        for b in range(3):
+            slow.put(f"/groups/0/blocks/{b}", json=payload("a"))
+        import threading
+        import time
+
+        def do_write():
+            slow.put("/groups/0/blocks/0", json=payload("z"))
+
+        t = threading.Thread(target=do_write)
+        t.start()
+        for _ in range(50):
+            if slow.get("/migrations").json().get("in_progress"):
+                break
+            time.sleep(0.02)
+        v1 = slow.get("/groups/0/blocks/1").json()["version"]
+        assert slow.post(
+            "/groups/0/discards",
+            json={"blocks": [{"block_id": 1, "version": v1}]},
+        ).status_code == 200
+        t.join()
+
+        assert slow.get("/groups/0/blocks/1").status_code == 404
+        active = [x for x in slow.get("/regions").json() if x["group_id"] == 0][0]
+        # 块1 被跳过：新区只装块0(pending) + 块2
+        assert active["used_slots"] == 2
+        assert active["valid_blocks"] == 2

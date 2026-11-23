@@ -10,9 +10,16 @@
 ======
 * 记录只能尾部追加（INSERT），物理槽位永不原地更新；读取取 (group, block)
   序列号最大的那条记录。
+* 每条记录带全局单调递增的写入版本 ``version``：每次新写入都换版本
+  （即使正文与上一版完全相同）；搬迁拷贝沿用源块的当前版本，不换号。
+  版本计数器持久化在 config 表，重启后继续递增。
+* 丢弃只登记逻辑墓碑（discards 表）：不占槽位、也不释放旧槽位，旧槽位
+  仍等整区重置才回收；墓碑持久化，重启后读口照样返回 404，直到该块
+  出现新写入（新写在同一事务删除墓碑）。
 * 只有整区重置（搬迁收尾时的 DELETE + 状态翻转）才能释放槽位。
 * 搬迁每一步都是独立事务，提交后即持久化，因此：
   - 已拷贝 / 已写入的块在搬迁中途即可读到新值；
+  - 已丢弃的块在搬迁拷贝时直接跳过，不进新区；
   - 任意时刻停机，重启后状态都自洽，搬迁可幂等续跑。
 
 区状态机：unused -> active -> migrating -> (源区) reset -> spare
@@ -54,6 +61,18 @@ class NoActiveRegion(StoreError):
 
 class NoMigration(StoreError):
     """当前没有进行中的搬迁。"""
+
+
+class BlockMissing(StoreError):
+    """待丢弃的逻辑块不存在（从未写入或已被丢弃）。"""
+
+
+class VersionMismatch(StoreError):
+    """丢弃请求携带的版本与块的当前写入版本不一致。"""
+
+
+class PendingOverwrite(StoreError):
+    """存在已登记但尚未生效的覆盖（搬迁 pending 未落盘），丢弃整批拒绝。"""
 
 
 class PartitionStore:
@@ -118,7 +137,8 @@ class PartitionStore:
                     slot_index INTEGER NOT NULL,
                     group_id   INTEGER NOT NULL,
                     block_id   INTEGER NOT NULL,
-                    data       BLOB NOT NULL
+                    data       BLOB NOT NULL,
+                    version    INTEGER
                 )
                 """,
                 "CREATE INDEX IF NOT EXISTS idx_records_lookup"
@@ -137,8 +157,34 @@ class PartitionStore:
                     last_copied_block_id  INTEGER
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS discards (
+                    group_id    INTEGER NOT NULL,
+                    block_id    INTEGER NOT NULL,
+                    version     INTEGER NOT NULL,
+                    PRIMARY KEY (group_id, block_id)
+                )
+                """,
             ):
                 c.execute(ddl)
+            # 旧库平滑升级：records 早期没有 version 列，按 seq 补齐版本号
+            cols = {
+                r["name"]
+                for r in c.execute("PRAGMA table_info(records)").fetchall()
+            }
+            if "version" not in cols:
+                c.execute("ALTER TABLE records ADD COLUMN version INTEGER")
+                c.execute(
+                    "UPDATE records SET version = seq WHERE version IS NULL"
+                )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_lookup"
+                " ON records(group_id, block_id, seq)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_region"
+                " ON records(region_id, slot_index)"
+            )
             # 配置持久化：库已存在时以库内参数为准，保证重启布局不变
             cfg = {
                 r["key"]: r["value"]
@@ -150,11 +196,21 @@ class PartitionStore:
                     [
                         ("slots_per_region", self._slots),
                         ("block_size", self._block_size),
+                        ("next_version", 1),
                     ],
                 )
             else:
                 self._slots = int(cfg["slots_per_region"])
                 self._block_size = int(cfg["block_size"])
+                if "next_version" not in cfg:
+                    # 旧库首次升级：版本计数器从现存最大版本之后继续
+                    max_version = c.execute(
+                        "SELECT COALESCE(MAX(version), 0) FROM records"
+                    ).fetchone()[0]
+                    c.execute(
+                        "INSERT INTO config(key, value) VALUES('next_version', ?)",
+                        (int(max_version) + 1,),
+                    )
 
             if c.execute("SELECT COUNT(*) FROM regions").fetchone()[0] == 0:
                 # 0 号区作为初始 spare，其余三个等待分配给三个组
@@ -187,19 +243,59 @@ class PartitionStore:
         except sqlite3.OperationalError:
             pass  # 事务已不存在（如隐式提交），原始异常照常向上抛
 
-    def _append(self, region_id: int, group_id: int, block_id: int, data: bytes) -> dict:
-        """在指定区尾部追加一条记录（调用方需已开启事务）。"""
+    def _next_version(self) -> int:
+        """分配一个全局单调递增的写入版本（调用方需已开启事务）。
+
+        计数器持久化在 config 表，重启后继续递增；搬迁拷贝沿用源记录的
+        旧版本，不走这里，因此只有真正的新写入才会换版本。
+        """
+        version = self._conn.execute(
+            "SELECT value FROM config WHERE key='next_version'"
+        ).fetchone()[0]
+        self._conn.execute(
+            "UPDATE config SET value=? WHERE key='next_version'", (version + 1,)
+        )
+        return int(version)
+
+    def _append(
+        self,
+        region_id: int,
+        group_id: int,
+        block_id: int,
+        data: bytes,
+        version: int,
+    ) -> dict:
+        """在指定区尾部追加一条记录（调用方需已开启事务）。
+
+        新记录落盘即覆盖任何旧墓碑：该块重新可读，直到再次被丢弃。
+        """
         used = self._conn.execute(
             "SELECT COUNT(*) FROM records WHERE region_id=?", (region_id,)
         ).fetchone()[0]
         if used >= self._slots:
             raise RegionFull(f"物理区 {region_id} 槽位已满")
-        cur = self._conn.execute(
-            "INSERT INTO records(region_id, slot_index, group_id, block_id, data)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (region_id, used, group_id, block_id, sqlite3.Binary(bytes(data))),
+        self._conn.execute(
+            "DELETE FROM discards WHERE group_id=? AND block_id=?",
+            (group_id, block_id),
         )
-        return {"seq": cur.lastrowid, "region_id": region_id, "slot_index": used}
+        cur = self._conn.execute(
+            "INSERT INTO records(region_id, slot_index, group_id, block_id, data,"
+            " version) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                region_id,
+                used,
+                group_id,
+                block_id,
+                sqlite3.Binary(bytes(data)),
+                version,
+            ),
+        )
+        return {
+            "seq": cur.lastrowid,
+            "region_id": region_id,
+            "slot_index": used,
+            "version": int(version),
+        }
 
     def _find_active(self, group_id: int) -> int | None:
         row = self._conn.execute(
@@ -209,31 +305,74 @@ class PartitionStore:
         return None if row is None else row[0]
 
     # ------------------------------------------------------------------ 读路径
-    def read_latest(self, group_id: int, block_id: int) -> dict[str, Any] | None:
-        """返回逻辑块的最新值；搬迁期间新区已落盘的记录会自然胜出。"""
-        row = self._conn.execute(
-            "SELECT seq, region_id, slot_index, data FROM records"
+    def _latest_record_row(self, group_id: int, block_id: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT seq, region_id, slot_index, data, version FROM records"
             " WHERE group_id=? AND block_id=? ORDER BY seq DESC LIMIT 1",
             (group_id, block_id),
         ).fetchone()
+
+    def _is_discarded(self, group_id: int, block_id: int, version: int) -> bool:
+        """墓碑版本与记录版本一致才算“当前已丢弃”。
+
+        墓碑之后若有新写入，_append 已在同一事务删掉墓碑；保留这层版本
+        比对是为了让读路径对任何残留行都保持自洽。
+        """
+        d = self._conn.execute(
+            "SELECT version FROM discards WHERE group_id=? AND block_id=?",
+            (group_id, block_id),
+        ).fetchone()
+        return d is not None and int(d["version"]) == int(version)
+
+    def read_latest(self, group_id: int, block_id: int) -> dict[str, Any] | None:
+        """返回逻辑块的最新值；已丢弃且之后没有新写入的块返回 None。
+
+        搬迁期间新区已落盘的记录会自然胜出。
+        """
+        row = self._latest_record_row(group_id, block_id)
+        if row is None or self._is_discarded(group_id, block_id, row["version"]):
+            return None
+        return self._row_to_dict(row)
+
+    def read_latest_physical(
+        self, group_id: int, block_id: int
+    ) -> dict[str, Any] | None:
+        """忽略丢弃墓碑的物理最新记录（搬迁触发写的落盘回包专用）。"""
+        row = self._latest_record_row(group_id, block_id)
         if row is None:
             return None
+        return self._row_to_dict(row)
+
+    @staticmethod
+    def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "seq": row["seq"],
             "region_id": row["region_id"],
             "slot_index": row["slot_index"],
             "data": bytes(row["data"]),
+            "version": int(row["version"]),
         }
 
     def region_usage(self) -> list[dict[str, Any]]:
-        """各区槽位占用：used=已追加槽位（含历史版本），valid=当前有效逻辑块数。"""
+        """各区槽位占用：used=已追加槽位（含历史版本，丢弃不释放），
+        valid=当前仍可读的有效逻辑块数（已丢弃的块不计入）。"""
         rows = self._conn.execute(
             """
             SELECT r.region_id, r.status, r.group_id,
                    (SELECT COUNT(*) FROM records rec
                       WHERE rec.region_id = r.region_id) AS used_slots,
-                   (SELECT COUNT(DISTINCT rec.block_id) FROM records rec
-                      WHERE rec.region_id = r.region_id) AS valid_blocks
+                   (SELECT COUNT(*) FROM (
+                       SELECT rec.block_id, MAX(rec.version) AS mv
+                         FROM records rec
+                        WHERE rec.region_id = r.region_id
+                        GROUP BY rec.block_id
+                    ) live
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM discards d
+                          WHERE d.group_id = r.group_id
+                            AND d.block_id = live.block_id
+                            AND d.version = live.mv
+                     )) AS valid_blocks
               FROM regions r
              ORDER BY r.region_id
             """
@@ -254,7 +393,7 @@ class PartitionStore:
     def region_records(self, region_id: int) -> list[dict[str, Any]]:
         """查看某物理区每个槽位的实际内容（演练可视化用）。"""
         rows = self._conn.execute(
-            "SELECT seq, slot_index, group_id, block_id, data FROM records"
+            "SELECT seq, slot_index, group_id, block_id, data, version FROM records"
             " WHERE region_id=? ORDER BY slot_index",
             (region_id,),
         ).fetchall()
@@ -265,6 +404,7 @@ class PartitionStore:
                 "group_id": r["group_id"],
                 "block_id": r["block_id"],
                 "data": bytes(r["data"]),
+                "version": int(r["version"]),
             }
             for r in rows
         ]
@@ -311,9 +451,77 @@ class PartitionStore:
             if used >= self._slots:
                 self._rollback_safely()
                 return {"status": "full", "region_id": region_id}
-            meta = self._append(region_id, group_id, block_id, data)
+            meta = self._append(
+                region_id, group_id, block_id, data, self._next_version()
+            )
             c.execute("COMMIT")
             return {"status": "written", **meta}
+        except Exception:
+            self._rollback_safely()
+            raise
+
+    # ------------------------------------------------------------------ 丢弃
+    def discard_blocks(
+        self, group_id: int, items: list[tuple[int, int]]
+    ) -> list[dict[str, Any]]:
+        """单组批量丢弃：整批在一个事务内校验并登记墓碑。
+
+        ``items`` 为 ``(block_id, version)`` 列表，块号须由调用方保证互不重复。
+        任一校验失败都抛异常并回滚，所有块维持原状：
+        * :class:`PendingOverwrite` 本组有已登记但尚未生效的覆盖；
+        * :class:`BlockMissing` 块从未写入、或已被丢弃且之后没有新写入；
+        * :class:`VersionMismatch` 携带版本与当前写入版本不符。
+        丢弃不占槽位也不释放槽位：旧槽位等整区重置才回收。
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            pending = c.execute(
+                "SELECT 1 FROM migration WHERE id=1 AND group_id=?"
+                " AND pending_applied=0",
+                (group_id,),
+            ).fetchone()
+            if pending is not None:
+                self._rollback_safely()
+                raise PendingOverwrite(
+                    f"组 {group_id} 存在已登记但尚未生效的覆盖写，"
+                    "请等首步落盘后再丢弃"
+                )
+            discarded: list[dict[str, Any]] = []
+            for block_id, version in items:
+                row = self._latest_record_row(group_id, block_id)
+                if row is None:
+                    self._rollback_safely()
+                    raise BlockMissing(
+                        f"组 {group_id} 块 {block_id} 不存在或已被丢弃"
+                    )
+                if self._is_discarded(group_id, block_id, row["version"]):
+                    self._rollback_safely()
+                    raise BlockMissing(
+                        f"组 {group_id} 块 {block_id} 已被丢弃，"
+                        "需有新写入后才能再次丢弃"
+                    )
+                if int(version) != int(row["version"]):
+                    self._rollback_safely()
+                    raise VersionMismatch(
+                        f"组 {group_id} 块 {block_id} 版本不符："
+                        f"请求 {version}，当前 {row['version']}"
+                    )
+                c.execute(
+                    "INSERT INTO discards(group_id, block_id, version)"
+                    " VALUES (?, ?, ?)"
+                    " ON CONFLICT(group_id, block_id) DO UPDATE SET version=excluded.version",
+                    (group_id, block_id, int(version)),
+                )
+                discarded.append(
+                    {
+                        "group_id": group_id,
+                        "block_id": block_id,
+                        "version": int(version),
+                    }
+                )
+            c.execute("COMMIT")
+            return discarded
         except Exception:
             self._rollback_safely()
             raise
@@ -420,21 +628,29 @@ class PartitionStore:
             src, dst = m["src_region_id"], m["dst_region_id"]
             group_id, pending_block = m["group_id"], m["pending_block_id"]
 
-            # 步骤 1：触发写入的新值优先落盘
+            # 步骤 1：触发写入的新值优先落盘（每次写入都换新版本）
             if not m["pending_applied"]:
                 exists = c.execute(
                     "SELECT 1 FROM records WHERE region_id=? AND group_id=? AND block_id=?",
                     (dst, group_id, pending_block),
                 ).fetchone()
                 if exists is None:
-                    meta = self._append(dst, group_id, pending_block, m["pending_data"])
-                    seq = meta["seq"]
+                    meta = self._append(
+                        dst,
+                        group_id,
+                        pending_block,
+                        m["pending_data"],
+                        self._next_version(),
+                    )
+                    seq, version = meta["seq"], meta["version"]
                 else:
                     # 上一轮在 append 后、更新 pending_applied 前崩溃
-                    seq = c.execute(
-                        "SELECT MAX(seq) FROM records WHERE region_id=? AND block_id=?",
+                    row = c.execute(
+                        "SELECT seq, version FROM records"
+                        " WHERE region_id=? AND block_id=? ORDER BY seq DESC LIMIT 1",
                         (dst, pending_block),
-                    ).fetchone()[0]
+                    ).fetchone()
+                    seq, version = row["seq"], int(row["version"])
                 c.execute(
                     "UPDATE migration SET pending_applied=1 WHERE id=1"
                 )
@@ -446,29 +662,49 @@ class PartitionStore:
                     "src_region_id": src,
                     "dst_region_id": dst,
                     "seq": seq,
+                    "version": version,
                 }
 
-            # 步骤 2：拷贝源区里尚未出现在新区的下一个逻辑块（按块号升序，确定性）
+            # 步骤 2：拷贝源区里尚未出现在新区、且当前未被丢弃的下一个逻辑块
+            # （按块号升序，确定性）；已丢弃的块直接跳过，不进新区、不占槽位
             nxt = c.execute(
                 """
-                SELECT DISTINCT block_id FROM records
-                 WHERE region_id=?
-                   AND block_id NOT IN (
+                SELECT DISTINCT rec.block_id,
+                       (SELECT version FROM records
+                         WHERE region_id=rec.region_id AND block_id=rec.block_id
+                         ORDER BY seq DESC LIMIT 1) AS latest_version
+                  FROM records rec
+                 WHERE rec.region_id=?
+                   AND rec.block_id NOT IN (
                        SELECT block_id FROM records
                         WHERE region_id=? AND group_id=?
                    )
-                 ORDER BY block_id LIMIT 1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM discards d
+                        WHERE d.group_id=rec.group_id
+                          AND d.block_id=rec.block_id
+                          AND d.version = (
+                              SELECT version FROM records
+                               WHERE region_id=rec.region_id
+                                 AND block_id=rec.block_id
+                               ORDER BY seq DESC LIMIT 1
+                          )
+                   )
+                 ORDER BY rec.block_id LIMIT 1
                 """,
                 (src, dst, group_id),
             ).fetchone()
             if nxt is not None:
                 block_id = nxt[0]
                 latest = c.execute(
-                    "SELECT data FROM records WHERE region_id=? AND block_id=?"
-                    " ORDER BY seq DESC LIMIT 1",
+                    "SELECT data, version FROM records"
+                    " WHERE region_id=? AND block_id=? ORDER BY seq DESC LIMIT 1",
                     (src, block_id),
                 ).fetchone()
-                meta = self._append(dst, group_id, block_id, latest["data"])
+                # 搬迁沿用原版本：不分配新版本，版本号随数据一起拷贝
+                meta = self._append(
+                    dst, group_id, block_id, latest["data"], int(latest["version"])
+                )
                 c.execute(
                     "UPDATE migration SET last_copied_block_id=? WHERE id=1",
                     (block_id,),
@@ -586,6 +822,10 @@ class PartitionStore:
         try:
             c.execute("DELETE FROM records")
             c.execute("DELETE FROM migration")
+            c.execute("DELETE FROM discards")
+            c.execute(
+                "UPDATE config SET value=1 WHERE key='next_version'"
+            )
             c.execute("UPDATE regions SET status=?, group_id=NULL", (ST_UNUSED,))
             c.execute(
                 "UPDATE regions SET status=? WHERE region_id=0", (ST_SPARE,)

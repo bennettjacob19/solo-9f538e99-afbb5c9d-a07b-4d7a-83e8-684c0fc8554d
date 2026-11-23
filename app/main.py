@@ -21,6 +21,9 @@ from . import store as store_mod
 from .schemas import (
     BlockResponse,
     ConfigResponse,
+    DiscardItem,
+    DiscardRequest,
+    DiscardResponse,
     MigrationResponse,
     RegionDetailResponse,
     RegionResponse,
@@ -37,6 +40,7 @@ def _to_block_response(group_id: int, block_id: int, row: dict) -> BlockResponse
         group_id=group_id,
         block_id=block_id,
         seq=row["seq"],
+        version=row["version"],
         region_id=row["region_id"],
         slot_index=row["slot_index"],
         length=len(raw),
@@ -202,13 +206,59 @@ def create_app() -> FastAPI:
 
         # 锁外继续分步搬迁：每步重新取锁，其他组可在步间写入
         await _drain_migration(req)
-        row = store.read_latest(group_id, block_id)
+        # 触发搬迁的覆盖已生效：即使回包前该块被步间的丢弃请求删掉了
+        # 逻辑可见性，write 字段仍给出那次写入真实的落盘结果（物理读取，
+        # 不受墓碑影响）
+        row = store.read_latest_physical(group_id, block_id)
         return {
             "status": "migrated",
             "detail": "原 active 区已满，已完成整区搬迁并写入新值",
             "write": _to_block_response(group_id, block_id, row).model_dump(),
             "last_step": req.app.state.last_step,
         }
+
+    @app.post(
+        "/groups/{group_id}/discards",
+        response_model=DiscardResponse,
+        tags=["blocks"],
+        summary="单组批量丢弃块（携带各自写入版本，整批原子；冲突整批 409）",
+    )
+    async def discard_blocks(
+        group_id: int, body: DiscardRequest, req: Request
+    ):
+        store = get_store(req)
+        if not (0 <= group_id < store_mod.GROUP_COUNT):
+            raise HTTPException(422, f"group_id 须在 0..{store_mod.GROUP_COUNT - 1}")
+        for item in body.blocks:
+            if not (0 <= item.block_id < store.slots_per_region):
+                raise HTTPException(
+                    422,
+                    f"block_id 须在 0..{store.slots_per_region - 1}，"
+                    f"收到 {item.block_id}",
+                )
+        block_ids = [item.block_id for item in body.blocks]
+        if len(set(block_ids)) != len(block_ids):
+            raise HTTPException(400, "blocks 中的 block_id 必须互不重复")
+        items = [(item.block_id, item.version) for item in body.blocks]
+        # 与写路径共用同一把锁：丢弃与搬迁、写入串行，保证墓碑与落盘顺序确定
+        async with req.app.state.write_lock:
+            try:
+                discarded = store.discard_blocks(group_id, items)
+            except store_mod.StoreError as exc:
+                # BlockMissing / VersionMismatch / PendingOverwrite 统一 409，
+                # 事务已回滚，所有块维持原状
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"整批丢弃未生效：{exc}",
+                ) from exc
+        return DiscardResponse(
+            status="discarded",
+            group_id=group_id,
+            discarded=[
+                DiscardItem(block_id=d["block_id"], version=d["version"])
+                for d in discarded
+            ],
+        )
 
     # ---------------------------------------------------------------- 物理区
     @app.get(
@@ -239,6 +289,7 @@ def create_app() -> FastAPI:
                 slot_index=r["slot_index"],
                 group_id=r["group_id"],
                 block_id=r["block_id"],
+                version=r["version"],
                 data_base64=base64.b64encode(r["data"]).decode("ascii"),
             )
             for r in store.region_records(region_id)

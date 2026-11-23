@@ -32,6 +32,9 @@ class BlockResponse(BaseModel):
     group_id: int
     block_id: int
     seq: int
+    version: int = Field(
+        description="写入版本：每次写入全局单调递增；搬迁拷贝沿用原版本"
+    )
     region_id: int
     slot_index: int
     length: int
@@ -54,7 +57,29 @@ class SlotRecord(BaseModel):
     slot_index: int
     group_id: int
     block_id: int
+    version: int
     data_base64: str
+
+
+class DiscardItem(BaseModel):
+    """单个丢弃项：块号 + 客户端从读口拿到的写入版本。"""
+
+    block_id: int = Field(ge=0, description="逻辑块号")
+    version: int = Field(ge=1, description="该块当前的写入版本（读口返回的 version）")
+
+
+class DiscardRequest(BaseModel):
+    """单组批量丢弃请求；块号必须互不重复，整批原子生效或整批 409。"""
+
+    blocks: list[DiscardItem] = Field(
+        min_length=1, description="待丢弃块清单，块号互不重复"
+    )
+
+
+class DiscardResponse(BaseModel):
+    status: str
+    group_id: int
+    discarded: list[DiscardItem]
 
 
 class RegionDetailResponse(RegionResponse):
